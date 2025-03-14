@@ -1,5 +1,6 @@
 import cv2
 import os
+import time  # Import time module for delay
 from camera import Camera
 from detection.person_detector import PersonDetector
 # from detection.pig_detector import PigDetector  # Commented out pig detector import
@@ -15,6 +16,8 @@ person_detector = PersonDetector("models/person_model.pt")
 # Initialize Camera
 cam = Camera(RECORD_DIR)
 recording = False  # Flag to check if recording is active
+last_person_detected_time = None  # Track the last time a person was detected
+BUFFER_TIME = 1  # Buffer time in seconds to wait before stopping recording
 
 while True:
     frame = cam.get_frame()
@@ -29,11 +32,17 @@ while True:
     if person_detected and not recording:
         cam.start_recording()
         recording = True
+        last_person_detected_time = time.time()  # Update the last detection time
 
-    # Stop recording when the person leaves (only once)
-    elif not person_detected and recording:
-        cam.stop_recording()
-        recording = False
+    # Update the last detection time if a person is still detected
+    if person_detected:
+        last_person_detected_time = time.time()
+
+    # Stop recording when the person leaves (only once) after the buffer time
+    if recording and not person_detected:
+        if time.time() - last_person_detected_time > BUFFER_TIME:
+            cam.stop_recording()
+            recording = False
 
     # Write frame only if recording is active
     if recording:
