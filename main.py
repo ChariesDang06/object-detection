@@ -14,7 +14,7 @@ pig_detector = PigDetector("models/pig_model.pt")
 
 # Initialize Camera
 cam = Camera(RECORD_DIR)
-recording = False  # Flag to check if we are currently recording
+recording = False  # Flag to check if recording is active
 
 while True:
     frame = cam.get_frame()
@@ -25,17 +25,19 @@ while True:
     person_detected = person_detector.detect(frame)
     pig_detected = pig_detector.detect(frame)
 
+    # Start recording when a person is detected (only once)
     if person_detected and not recording:
         cam.start_recording()
         recording = True
 
-    if recording:
-        cam.write_frame(frame)
-
-    # If person leaves, stop recording
-    if not person_detected and recording:
+    # Stop recording when the person leaves (only once)
+    elif not person_detected and recording:
         cam.stop_recording()
         recording = False
+
+    # Write frame only if recording is active
+    if recording:
+        cam.write_frame(frame)
 
     # Display detection results
     cv2.putText(frame, f"Person: {person_detected}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -46,4 +48,5 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
+# Release resources
 cam.release()
