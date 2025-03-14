@@ -2,7 +2,7 @@ import cv2
 import os
 from camera import Camera
 from detection.person_detector import PersonDetector
-from detection.pig_detector import PigDetector
+# from detection.pig_detector import PigDetector  # Commented out pig detector import
 
 # Ensure recorded_videos directory exists
 RECORD_DIR = "recorded_videos/"
@@ -10,7 +10,7 @@ os.makedirs(RECORD_DIR, exist_ok=True)
 
 # Load models
 person_detector = PersonDetector("models/person_model.pt")
-pig_detector = PigDetector("models/pig_model.pt")
+# pig_detector = PigDetector("models/pig_model.pt")  # Commented out pig detector initialization
 
 # Initialize Camera
 cam = Camera(RECORD_DIR)
@@ -23,7 +23,7 @@ while True:
 
     # Detect persons and pigs
     person_detected = person_detector.detect(frame)
-    pig_detected = pig_detector.detect(frame)
+    # pig_detected = pig_detector.detect(frame)  # Commented out pig detection
 
     # Start recording when a person is detected (only once)
     if person_detected and not recording:
@@ -41,7 +41,7 @@ while True:
 
     # Display detection results
     cv2.putText(frame, f"Person: {person_detected}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(frame, f"Pig: {pig_detected}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    # cv2.putText(frame, f"Pig: {pig_detected}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)  # Commented out pig detection display
     
     cv2.imshow("Detection", frame)
 
