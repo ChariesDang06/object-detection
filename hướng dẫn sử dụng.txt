@@ -1,10 +1,12 @@
-đọc trước readme.txt để chạy backend lên
+đọc trước readme.txt để chạy backend lên nhe
 
 front end sẽ mở camera và gọi api detect để gửi frame hình từ video cho backend,
 Khi backend phát hiện có người đi vào tầm nhìn của camera sẽ bắt đầu quay và
 khi người đó đi ra khỏi tầm nhìn của camera thì backend sẽ tự đăng video này lên database mongodb.
+(xem file test.py để xem code demo)
 
 Để download video từ mongo db cần có video ID, chị như viết thêm api để get all thông tin các video để có được danh sách video ID
-truyền ID này vào api download sẽ tải được video xuống
+truyền ID này vào api download sẽ tải được video xuống hiện tại thì các bạn cứ gọi detect api trước rồi nói chị như đưa cho video id
+hoặc tự lấy id bằng cách copy connection string trong file server.py rồi bỏ vào tool mongodb compass để check(phải download tool)
 
-Chị như viết thêm phần ví dụ camera này là camera nào camera 1, camera 2...
+Chị như sẽ viết thêm phần ví dụ camera này là camera nào camera 1, camera 2... sau
