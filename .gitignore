@@ -161,3 +161,5 @@ cython_debug/
 
 #==========
 recorded_videos/
+firebase_config.json
+project-libs/
