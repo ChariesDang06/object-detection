@@ -20,6 +20,13 @@ pip install -r requirements.txt
 Step 1: activate the virtual venv you created
 Step 2: type `python main.py` in the terminal
 
+# Run server
+uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+
+# Test server
+Open your browser and go to:
+👉 http://127.0.0.1:8000/docs
+
 # everytime you install new package for the project
 remmember to run this to update the requirement.txt file
 `pip freeze > requirements.txt`
