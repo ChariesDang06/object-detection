@@ -18,15 +18,16 @@ pip install -r requirements.txt
 
 # Run project
 Step 1: activate the virtual venv you created
-Step 2: type `python main.py` in the terminal
-
-# Run server
+Step 2: this is an api project so run server is the next step:
 `uvicorn server:app --host 127.0.0.1 --port 8000 --reload`
-
-# Test server
-Open your browser and go to:
-👉 http://127.0.0.1:8000/docs
 
 # everytime you install new package for the project
 remmember to run this to update the requirement.txt file
 `pip freeze > requirements.txt`
+
+# local testesting
+## if you haven't create Front-end and want to understand how thigns work:
+run `python test.py`
+
+## if you want to see the offline demo of the project idea:
+run `python main.py`
