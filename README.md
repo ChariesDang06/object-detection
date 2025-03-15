@@ -21,7 +21,7 @@ Step 1: activate the virtual venv you created
 Step 2: type `python main.py` in the terminal
 
 # Run server
-uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+`uvicorn server:app --host 127.0.0.1 --port 8000 --reload`
 
 # Test server
 Open your browser and go to:
