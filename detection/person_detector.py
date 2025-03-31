@@ -20,19 +20,25 @@ class PersonDetector:
             output = self.model(tensor_image)
         return self.postprocess(output)
 
+    def count_people(self, frame):
+        """Count the number of detected persons in a frame"""
+        tensor_image = self.preprocess(frame)
+        with torch.no_grad():
+            output = self.model(tensor_image)
+        
+        return self.postprocess_count(output)
+
     def postprocess(self, output):
         threshold = 0.5  # Adjust as needed
-
-        # Ensure output is not empty and contains detection results
         if hasattr(output[0], "boxes") and output[0].boxes is not None and len(output[0].boxes) > 0:
-            confs = output[0].boxes.conf  # List of confidence scores
-
-            if isinstance(confs, torch.Tensor):
-                probability = confs.max().item()  # Get the highest confidence score
-            else:
-                probability = max(confs) if confs else 0.0  # Get max confidence from list
+            confs = output[0].boxes.conf
+            probability = confs.max().item() if isinstance(confs, torch.Tensor) else max(confs, default=0.0)
         else:
-            probability = 0.0  # No detection
-    
+            probability = 0.0  
         return probability > threshold
 
+    def postprocess_count(self, output):
+        """Extract number of detected persons"""
+        if hasattr(output[0], "boxes") and output[0].boxes is not None:
+            return len(output[0].boxes)  # Count the number of detected objects
+        return 0  # No detection

@@ -1,8 +1,12 @@
 import cv2
 import requests
 import threading
+import webbrowser
+import tkinter as tk
+from tkinter import Button
 
 API_URL = "http://127.0.0.1:8000/detect"  # Adjust if needed
+STREAM_URL = "http://127.0.0.1:5000/video_feed/0"  # Flask stream endpoint
 
 def send_frame_to_api(frame):
     """Encodes a frame and sends it to the FastAPI server in a separate thread."""
@@ -44,5 +48,18 @@ def open_camera():
     cap.release()
     cv2.destroyAllWindows()
 
+def watch_stream():
+    """Opens the camera stream in a web browser."""
+    webbrowser.open(STREAM_URL)
+
 if __name__ == "__main__":
+    # Create a simple GUI with a button to watch the stream
+    root = tk.Tk()
+    root.title("Camera Stream")
+    
+    watch_button = Button(root, text="Watch Stream", command=watch_stream, font=("Arial", 14))
+    watch_button.pack(pady=20)
+    
+    root.mainloop()
+    
     open_camera()

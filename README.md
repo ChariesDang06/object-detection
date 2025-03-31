@@ -20,6 +20,7 @@ pip install -r requirements.txt
 Step 1: activate the virtual venv you created
 Step 2: this is an api project so run server is the next step:
 `uvicorn server:app --host 127.0.0.1 --port 8000 --reload`
+`uvicorn main:app --host 127.0.0.1 --port 8000`
 
 # everytime you install new package for the project
 remmember to run this to update the requirement.txt file
