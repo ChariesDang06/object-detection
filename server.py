@@ -301,7 +301,7 @@ def start_scheduler():
 #         )
 
 #     # Gửi tới ChatGPT API
-#     openai.api_key = "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"
+#     openai.api_key = "key"
 #     response = openai.ChatCompletion.create(
 #         model="gpt-4",
 #         messages=[
@@ -375,7 +375,7 @@ def analyze_now_route(request: Request):
     #     ]
     # )
 
-    openai.api_key = "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"
+    openai.api_key = "key"
     response = openai.completions.create(
     model="gpt-4o",
     prompt=generate_prompt(events),
