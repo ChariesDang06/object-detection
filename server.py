@@ -1,5 +1,5 @@
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Response, HTTPException
 import cv2
 import numpy as np
 import asyncio
@@ -8,113 +8,124 @@ import pymongo
 import gridfs
 from detection.person_detector import PersonDetector
 from bson import ObjectId
-from datetime import datetime
+from datetime import datetime, timedelta
 import urllib.parse
 import openai
 import os
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+
 
 app = FastAPI()
+
+# Configure CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # MongoDB setup
 username = urllib.parse.quote_plus("2112727")
 password = urllib.parse.quote_plus("admin@123")
 MONGO_URI = f"mongodb+srv://{username}:{password}@object-detection.3sedu.mongodb.net/?retryWrites=true&w=majority&appName=object-detection"
 sync_client = pymongo.MongoClient(MONGO_URI)
-db = sync_client["video_storage"]
+db = sync_client["detection"]
 fs = gridfs.GridFS(db)
 events_collection = db["events"]
 
 # Load the person detection model
 detector = PersonDetector("models/person_model.pt")
 
-# Camera streams (replace with actual URLs or indexes)
-# camera_sources = {
-#     "CAM_001": 0,  # Example: Local webcam
-#     "CAM_002": "rtsp://your_camera_ip"
-# }
-
-# camera_streams = {}
-# recording_buffers = {camera: [] for camera in camera_sources}
-# latest_events = {}
-# BUFFER_TIME = 2  # Seconds before stopping recording
-# frame_intervals = {camera: 0 for camera in camera_sources}  # Track frames per camera
-# person_counts = {camera: 0 for camera in camera_sources}  # Track person count per camera
-
-# # Open cameras
-# for cam_id, source in camera_sources.items():
-#     camera_streams[cam_id] = cv2.VideoCapture(source)
-
-# Fetch camera sources from the database
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Response, HTTPException
-import cv2
-import numpy as np
-import asyncio
-import time
-import pymongo
-import gridfs
-from detection.person_detector import PersonDetector
-from bson import ObjectId
-from datetime import datetime
-import urllib.parse
-import os
-
-app = FastAPI()
-
-# MongoDB setup
-username = urllib.parse.quote_plus("2112727")
-password = urllib.parse.quote_plus("admin@123")
-MONGO_URI = f"mongodb+srv://{username}:{password}@object-detection.3sedu.mongodb.net/?retryWrites=true&w=majority&appName=object-detection"
-sync_client = pymongo.MongoClient(MONGO_URI)
-db = sync_client["video_storage"]
-fs = gridfs.GridFS(db)
-events_collection = db["events"]
-
-# Load the person detection model
-detector = PersonDetector("models/person_model.pt")
-
-# Camera sources and stream setup
+# Global variables for live camera streams
 camera_sources = {}
+camera_sources = {"LAPTOP_CAM": 0}
 camera_streams = {}
 recording_buffers = {}
 latest_events = {}
-BUFFER_TIME = 2
+BUFFER_TIME = 2  # Seconds before stopping recording for live cameras
 frame_intervals = {}
 person_counts = {}
 
-# Detection recording control variables (for /detect endpoint)
+# Global variables for the upload-based detection (/detect endpoint)
+# "UPLOAD_CAM" is used as an identifier for videos coming from uploaded files.
 recording = False
 last_person_detected_time = None
 video_buffer = []
-cameraID = "UPLOAD_CAM"  # Identifier for uploaded video (not live stream)
+cameraID = "UPLOAD_CAM"
+
+# ----------------- New Endpoints for Camera -----------------
+
+@app.post("/add_cameras")
+async def add_camera(request: Request):
+    camera = await request.json()
+    # Check if the camera already exists using the provided _id
+    existing_camera = db["cameras"].find_one({"_id": camera["_id"]})
+    if existing_camera:
+        return {"error": "Camera already exists."}
+    # Directly insert the camera information into the "cameras" collection
+    db["cameras"].insert_one(camera)
+    return {"message": "Camera added successfully."}
+
+@app.get("/cameras")
+async def get_cameras():
+    # Lấy toàn bộ camera 
+    cameras = list(db["cameras"].find({}))
+    for cam in cameras:
+        cam["_id"] = str(cam["_id"])
+    return {"cameras": cameras}
+
+
+# ----------------- Initialization on Startup -------------------
 
 @app.on_event("startup")
 async def load_camera_sources():
-    """Load camera sources from the database on application startup."""
-    global camera_sources
+    """Load camera sources from the database on application startup and include default sources."""
+    global camera_sources, camera_streams
     try:
+        # Optionally, load additional cameras from the database
         cameras = db["cameras"].find({"is_active": True})
         for camera in cameras:
             cam_id = camera["_id"]
             source = camera["rtsp_url"]
+            # Add or update the camera_sources dictionary
             camera_sources[cam_id] = source
+        
+        # Print the final camera sources dictionary to verify that it's set correctly
+        print(f"Loaded camera sources: {camera_sources}")
 
+        # Open each camera stream using OpenCV
         for cam_id, source in camera_sources.items():
             camera_streams[cam_id] = cv2.VideoCapture(source)
 
-        print(f"Loaded camera sources: {camera_sources}")
     except Exception as e:
         print(f"Error loading camera sources: {e}")
 
 @app.on_event("startup")
-async def initialize_buffers():
+async def initialize_buffers_and_detection_vars():
+    """Initialize the buffers for live streaming and the globals for upload detection."""
     global recording_buffers, frame_intervals, person_counts
+    # Initialize structures for live cameras (if any)
     recording_buffers = {camera: [] for camera in camera_sources}
     frame_intervals = {camera: 0 for camera in camera_sources}
     person_counts = {camera: 0 for camera in camera_sources}
-
+    
+    # Initialize detection variables for the upload-based detection endpoint
+    global recording, last_person_detected_time, video_buffer, latest_events
+    recording = False
+    last_person_detected_time = 0  # Ensure a numeric starting point
+    video_buffer = []
+    # Pre-initialize the UPLOAD_CAM key for the latest events dictionary
+    latest_events[cameraID] = {}
+    
 @app.on_event("startup")
 async def start_camera_task():
     asyncio.create_task(capture_frames())
+
+# ----------------- Live Camera Processing -------------------
 
 async def capture_frames():
     global frame_intervals
@@ -123,27 +134,56 @@ async def capture_frames():
             ret, frame = cap.read()
             if ret:
                 frame_intervals[cam_id] += 1
+                # Process frames at specific intervals for performance
                 if frame_intervals[cam_id] % 10 in [5, 15]:
                     await process_frame(cam_id, frame)
         await asyncio.sleep(0.05)
 
 async def process_frame(cam_id, frame):
-    global latest_events, person_counts
+    global latest_events, person_counts, recording, video_buffer, last_person_detected_time, recording_buffers
+    global cameraID, BUFFER_TIME
     person_count = detector.count_people(frame)
-    prev_count = person_counts[cam_id]
+    prev_count = person_counts.get(cam_id, 0)
     person_counts[cam_id] = person_count
+    person_detected = detector.detect(frame)
+
+    if person_detected:
+        last_person_detected_time = time.time()
+        if not recording:
+            recording = True
+            video_buffer = []
+            print("Recording started")
+
+    if recording:
+        video_buffer.append(frame)
+
+    # If no person detected and the buffer time has expired, stop recording and save
+    if recording and not person_detected:
+        if time.time() - last_person_detected_time > BUFFER_TIME:
+            recording = False
+            video_id = save_video_to_mongodb(video_buffer)
+
+            latest_event = {
+                "event_type": "Human detect",
+                "video_recorded": str(video_id),
+                "event_time": datetime.now().isoformat(),
+                "cameraID": cameraID
+            }
+            latest_events[cameraID] = latest_event
+            events_collection.insert_one(latest_event)
+            print("Recording stopped and event saved to MongoDB")
+
 
     if person_count > 0:
         recording_buffers[cam_id].append(frame)
 
     if person_count != prev_count:
         event = {
-            "event_type": "Count changes",
-            "message": "Count changes",
+            "event_type": "Object count changes",
             "previousCount": prev_count,
             "currentCount": person_count,
             "cameraID": cam_id,
-            "event_time": datetime.utcnow().isoformat()
+            "event_time": datetime.now().isoformat()
         }
         latest_events[cam_id] = event
         events_collection.insert_one(event)
@@ -151,9 +191,8 @@ async def process_frame(cam_id, frame):
     if prev_count > 0 and person_count == 0:
         event = {
             "event_type": "Object leaving detected",
-            "message": "Object leaving detected",
             "cameraID": cam_id,
-            "event_time": datetime.utcnow().isoformat()
+            "event_time": datetime.now().isoformat()
         }
         latest_events[cam_id] = event
         events_collection.insert_one(event)
@@ -176,54 +215,7 @@ async def stream_camera(websocket: WebSocket, cam_id: str):
     except WebSocketDisconnect:
         print(f"Client disconnected from {cam_id}")
 
-
-
-
-@app.post("/detect")
-async def detect_human(file: UploadFile = File(...)):
-    global recording, last_person_detected_time, video_buffer, latest_events
-
-    contents = await file.read()
-    np_array = np.frombuffer(contents, np.uint8)
-    frame = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
-
-    person_detected = detector.detect(frame)
-
-    if person_detected:
-        last_person_detected_time = time.time()
-        if not recording:
-            recording = True
-            video_buffer = []
-            print("Recording started")
-
-    if recording:
-        video_buffer.append(frame)
-
-    if recording and not person_detected:
-        if time.time() - last_person_detected_time > BUFFER_TIME:
-            recording = False
-            video_id = save_video_to_mongodb(video_buffer)
-
-            latest_event = {
-                "event_type": "Person Detected",
-                "message": "Motion detected, video recorded",
-                "video_recorded": str(video_id),
-                "event_time": datetime.utcnow().isoformat(),
-                "cameraID": cameraID
-            }
-            latest_events[cameraID] = latest_event
-            events_collection.insert_one(latest_event)
-            print("Recording stopped and event saved to MongoDB")
-
-            return latest_event
-
-    return {"person_detected": person_detected}
-
-@app.get("/latest_event")
-async def get_latest_event_upload():
-    if latest_events.get(cameraID):
-        return latest_events[cameraID]
-    return {"message": "No detection events recorded yet."}
+# ----------------- Upload Detection Endpoint -------------------
 
 def save_video_to_mongodb(frames):
     if not frames:
@@ -244,15 +236,45 @@ def save_video_to_mongodb(frames):
     os.remove(temp_filename)
     return video_id
 
-@app.get("/download/{video_id}")
-async def download_video(video_id: str):
+@app.get("/api/videos/{video_id}")
+async def stream_video(video_id: str):
     try:
-        video_file = fs.get(ObjectId(video_id))
-        return Response(content=video_file.read(), media_type="video/mp4", headers={
-            "Content-Disposition": f"attachment; filename={video_file.filename}"
-        })
-    except gridfs.errors.NoFile:
-        raise HTTPException(status_code=404, detail="Video not found")
+        # Convert string ID to ObjectId
+        obj_id = ObjectId(video_id)
+    
+        # Find the video in MongoDB
+        video = events_collection.find_one({"video_recorded": obj_id})
+        
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get the binary data and content type
+        video_data = video.get("binaryData")
+        content_type = video.get("contentType", "video/mp4")
+        
+        # Create a file-like object from binary data
+        video_stream = io.BytesIO(video_data)
+        
+        # Return as streaming response
+        return StreamingResponse(
+            video_stream,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f"inline; filename={video_id}.mp4",
+                "Accept-Ranges": "bytes"
+            }
+        )
+        
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail="Server error")
+
+#======TO DO ===================
+#Change dơwnload video to use streaming response select by event_type
+# @app.get("/latest_event/{cam_id}")
+# async def latest_event(cam_id: str):
+#     return {"event": f"Latest event for {cam_id}"}
 
 @app.get("/events")
 async def get_events():
@@ -363,17 +385,6 @@ def analyze_now_route(request: Request):
 
     if not events:
         return jsonify({"message": "Không có sự kiện Count changes nào."}), 404
-
-    
-    # prompt = generate_prompt(events)
-
-    # response = openai.ChatCompletion.create(
-    #     model="gpt-4",
-    #     messages=[
-    #         {"role": "system", "content": "Bạn là chuyên gia phân tích dữ liệu nông nghiệp."},
-    #         {"role": "user", "content": prompt}
-    #     ]
-    # )
 
     openai.api_key = "key"
     response = openai.completions.create(
