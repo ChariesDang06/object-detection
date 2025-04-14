@@ -17,6 +17,9 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 
+
+
+
 app = FastAPI()
 
 # Configure CORSMiddleware
@@ -42,8 +45,9 @@ detector = PersonDetector("models/person_model.pt")
 
 # Global variables for live camera streams
 camera_sources = {}
-camera_sources = {"LAPTOP_CAM": 0}
 camera_streams = {}
+camera_sources = {"LAPTOP_CAM": 0}
+camera_streams = {"LAPTOP_CAM": cv2.VideoCapture(0)}
 recording_buffers = {}
 latest_events = {}
 BUFFER_TIME = 2  # Seconds before stopping recording for live cameras
@@ -91,10 +95,7 @@ async def load_camera_sources():
         for camera in cameras:
             cam_id = camera["_id"]
             source = camera["rtsp_url"]
-            # Add or update the camera_sources dictionary
             camera_sources[cam_id] = source
-        
-        # Print the final camera sources dictionary to verify that it's set correctly
         print(f"Loaded camera sources: {camera_sources}")
 
         # Open each camera stream using OpenCV
@@ -106,7 +107,6 @@ async def load_camera_sources():
 
 @app.on_event("startup")
 async def initialize_buffers_and_detection_vars():
-    """Initialize the buffers for live streaming and the globals for upload detection."""
     global recording_buffers, frame_intervals, person_counts
     # Initialize structures for live cameras (if any)
     recording_buffers = {camera: [] for camera in camera_sources}
@@ -141,7 +141,8 @@ async def capture_frames():
 
 async def process_frame(cam_id, frame):
     global latest_events, person_counts, recording, video_buffer, last_person_detected_time, recording_buffers
-    global cameraID, BUFFER_TIME
+    global cameraID, BUFFER_TIME, record_start_time  # record_start_time needs to be declared globally
+    
     person_count = detector.count_people(frame)
     prev_count = person_counts.get(cam_id, 0)
     person_counts[cam_id] = person_count
@@ -152,6 +153,7 @@ async def process_frame(cam_id, frame):
         if not recording:
             recording = True
             video_buffer = []
+            record_start_time = time.time()  # Start timing recording
             print("Recording started")
 
     if recording:
@@ -159,9 +161,10 @@ async def process_frame(cam_id, frame):
 
     # If no person detected and the buffer time has expired, stop recording and save
     if recording and not person_detected:
-        if time.time() - last_person_detected_time > BUFFER_TIME:
+        if time.time() - last_person_detected_time > (BUFFER_TIME + 2):
             recording = False
-            video_id = save_video_to_mongodb(video_buffer)
+            record_end_time = time.time()  # End timing recording
+            video_id = save_video_to_mongodb(video_buffer, record_start_time, record_end_time)
 
             latest_event = {
                 "event_type": "Human detect",
@@ -217,7 +220,7 @@ async def stream_camera(websocket: WebSocket, cam_id: str):
 
 # ----------------- Upload Detection Endpoint -------------------
 
-def save_video_to_mongodb(frames):
+def save_video_to_mongodb(frames, start_time, end_time):
     if not frames:
         return None
 
@@ -225,7 +228,12 @@ def save_video_to_mongodb(frames):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     temp_filename = f"temp_video_{int(time.time())}.mp4"
 
-    out = cv2.VideoWriter(temp_filename, fourcc, 20.0, (width, height))
+    duration = end_time - start_time
+    effective_fps = len(frames) / duration if duration > 0 else 20.0  
+    speed_multiplier = 1.2  
+    adjusted_fps = effective_fps * speed_multiplier
+
+    out = cv2.VideoWriter(temp_filename, fourcc, adjusted_fps, (width, height))
     for frame in frames:
         out.write(frame)
     out.release()
@@ -236,39 +244,43 @@ def save_video_to_mongodb(frames):
     os.remove(temp_filename)
     return video_id
 
-@app.get("/api/videos/{video_id}")
-async def stream_video(video_id: str):
+
+
+@app.get("/download/{video_id}")
+async def download_video(video_id: str):
+    """Fetch and return a video file from MongoDB GridFS."""
     try:
-        # Convert string ID to ObjectId
-        obj_id = ObjectId(video_id)
-    
-        # Find the video in MongoDB
-        video = events_collection.find_one({"video_recorded": obj_id})
-        
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        # Get the binary data and content type
-        video_data = video.get("binaryData")
-        content_type = video.get("contentType", "video/mp4")
-        
-        # Create a file-like object from binary data
-        video_stream = io.BytesIO(video_data)
-        
-        # Return as streaming response
-        return StreamingResponse(
-            video_stream,
-            media_type=content_type,
+        video_file = fs.get(ObjectId(video_id))  # Retrieve file from GridFS
+        return Response(
+            content=video_file.read(),
+            media_type="video/mp4",
             headers={
-                "Content-Disposition": f"inline; filename={video_id}.mp4",
-                "Accept-Ranges": "bytes"
+                "Content-Disposition": f"attachment; filename={video_file.filename}"
             }
         )
-        
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail="Server error")
+    except gridfs.errors.NoFile:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+@app.get("/video_feed/{cam_id}")
+async def video_feed(cam_id: str):
+    def generate():
+        while True:
+            ret, frame = camera_streams[cam_id].read()
+            if not ret:
+                continue  
+
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue  
+
+            # Yield the frame in byte format using the standard multipart boundary format
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n'
+            )
+            
+            time.sleep(0.03)
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 #======TO DO ===================
 #Change dơwnload video to use streaming response select by event_type
