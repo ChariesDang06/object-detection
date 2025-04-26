@@ -200,7 +200,7 @@ async def process_frame(cam_id: str, frame):
     person_counts[cam_id] = person_count
     detected = detector.detect(frame)
 
-    if cam_id == "SIM_CAM":
+    if cam_id == "SIM_CAM" or cam_id == "PIG_CROSS_LINE_CAM":
         return
 
     if detected:
@@ -227,6 +227,25 @@ async def process_frame(cam_id: str, frame):
         latest_events[cameraID] = evt
         events_collection.insert_one(evt)
         print("Recording stopped and event saved")
+
+@app.post("/add_cameras")
+async def add_camera(request: Request):
+    camera = await request.json()
+    # Check if the camera already exists using the provided _id
+    existing_camera = db["cameras"].find_one({"_id": camera["_id"]})
+    if existing_camera:
+        return {"error": "Camera already exists."}
+    # Directly insert the camera information into the "cameras" collection
+    db["cameras"].insert_one(camera)
+    return {"message": "Camera added successfully."}
+ 
+@app.get("/cameras")
+async def get_cameras():
+    # Lấy toàn bộ camera 
+    cameras = list(db["cameras"].find({}))
+    for cam in cameras:
+        cam["_id"] = str(cam["_id"])
+    return {"cameras": cameras}
 
 # Endpoints
 @app.get("/latest_event/{cam_id}")
@@ -304,5 +323,13 @@ async def video_feed(cam_id: str):
 async def get_events():
     events = list(events_collection.find({}, {"_id": 0}))
     return {"events": events}
+
+
+@app.get("/personCount")              
+async def person_count():               
+    total = sum(person_counts.values()) 
+    status = "has person" if total > 0 else "no person"  
+    print(f"Person count: {total} ({status})")
+    return {"status": status}        
 
 
