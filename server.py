@@ -1,31 +1,26 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Response, HTTPException
 import cv2
-import numpy as np
 import asyncio
 import time
 import pymongo
 import gridfs
 from detection.person_detector import PersonDetector
+from detection.pig_detector import PigDetector
 from bson import ObjectId
-from datetime import datetime, timedelta
+from datetime import datetime
 import urllib.parse
-import openai
 import os
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-
-
-
-
+import glob
 
 app = FastAPI()
 
-# Configure CORSMiddleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], 
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,167 +34,201 @@ sync_client = pymongo.MongoClient(MONGO_URI)
 db = sync_client["detection"]
 fs = gridfs.GridFS(db)
 events_collection = db["events"]
+PIG_ZONE_POINTS = [(150, 0), (1130, 0), (1130, 720), (150, 720)]
 
-# Load the person detection model
+
+# Load detectors
 detector = PersonDetector("models/person_model.pt")
+pig_detector = PigDetector("models/pig_model.pt", zone_points=PIG_ZONE_POINTS)
 
-# Global variables for live camera streams
-camera_sources = {}
-camera_streams = {}
+# Globals
 camera_sources = {"LAPTOP_CAM": 0}
-camera_streams = {"LAPTOP_CAM": cv2.VideoCapture(0)}
+camera_streams = {cam: cv2.VideoCapture(src) for cam, src in camera_sources.items()}
 recording_buffers = {}
 latest_events = {}
-BUFFER_TIME = 2  # Seconds before stopping recording for live cameras
+BUFFER_TIME = 2
 frame_intervals = {}
 person_counts = {}
+pig_counts = {}
 
-# Global variables for the upload-based detection (/detect endpoint)
-# "UPLOAD_CAM" is used as an identifier for videos coming from uploaded files.
+
+# Upload-based detection vars
 recording = False
 last_person_detected_time = None
 video_buffer = []
 cameraID = "UPLOAD_CAM"
 
-# ----------------- New Endpoints for Camera -----------------
-
-@app.post("/add_cameras")
-async def add_camera(request: Request):
-    camera = await request.json()
-    # Check if the camera already exists using the provided _id
-    existing_camera = db["cameras"].find_one({"_id": camera["_id"]})
-    if existing_camera:
-        return {"error": "Camera already exists."}
-    # Directly insert the camera information into the "cameras" collection
-    db["cameras"].insert_one(camera)
-    return {"message": "Camera added successfully."}
-
-@app.get("/cameras")
-async def get_cameras():
-    # Lấy toàn bộ camera 
-    cameras = list(db["cameras"].find({}))
-    for cam in cameras:
-        cam["_id"] = str(cam["_id"])
-    return {"cameras": cameras}
-
-
-# ----------------- Initialization on Startup -------------------
-
+# Startup: initialize buffers and tasks
 @app.on_event("startup")
-async def load_camera_sources():
-    """Load camera sources from the database on application startup and include default sources."""
-    global camera_sources, camera_streams
-    try:
-        # Optionally, load additional cameras from the database
-        cameras = db["cameras"].find({"is_active": True})
-        for camera in cameras:
-            cam_id = camera["_id"]
-            source = camera["rtsp_url"]
-            camera_sources[cam_id] = source
-        print(f"Loaded camera sources: {camera_sources}")
+async def initialize_all():
+    global recording_buffers, frame_intervals, person_counts, pig_counts, latest_events
 
-        # Open each camera stream using OpenCV
-        for cam_id, source in camera_sources.items():
-            camera_streams[cam_id] = cv2.VideoCapture(source)
+    # Init live cameras
+    for cam in camera_sources:
+        recording_buffers[cam] = []
+        frame_intervals[cam] = 0
+        person_counts[cam] = 0
+        pig_counts[cam] = 0
+        
 
-    except Exception as e:
-        print(f"Error loading camera sources: {e}")
-
-@app.on_event("startup")
-async def initialize_buffers_and_detection_vars():
-    global recording_buffers, frame_intervals, person_counts
-    # Initialize structures for live cameras (if any)
-    recording_buffers = {camera: [] for camera in camera_sources}
-    frame_intervals = {camera: 0 for camera in camera_sources}
-    person_counts = {camera: 0 for camera in camera_sources}
-    
-    # Initialize detection variables for the upload-based detection endpoint
-    global recording, last_person_detected_time, video_buffer, latest_events
-    recording = False
-    last_person_detected_time = 0  # Ensure a numeric starting point
-    video_buffer = []
-    # Pre-initialize the UPLOAD_CAM key for the latest events dictionary
+    # Init upload cam
     latest_events[cameraID] = {}
-    
-@app.on_event("startup")
-async def start_camera_task():
-    asyncio.create_task(capture_frames())
 
-# ----------------- Live Camera Processing -------------------
+    # Launch tasks
+    asyncio.create_task(capture_frames())
+    asyncio.create_task(feed_images("SIM_CAM"))
+    asyncio.create_task(track_pig_cross_line())
+
+async def feed_images(cam_id: str):
+    """
+    Only pig count events from folder images every 15 seconds.
+    """
+    folder = os.path.join(os.path.dirname(__file__), "pig-images-feed")
+    patterns = ["*.jpg", "*.jpeg", "*.png"]
+    files = []
+    for p in patterns:
+        files.extend(glob.glob(os.path.join(folder, p)))
+    files.sort()
+
+    while True:
+        for img_path in files:
+            frame = cv2.imread(img_path)
+            if frame is None:
+                continue
+
+            prev = pig_counts.get(cam_id, 0)
+            count = pig_detector.count(frame)
+            pig_counts[cam_id] = count
+
+            if count != prev:
+                evt = {
+                    "event_type": "Pig count changes",
+                    "previousCount": prev,
+                    "currentCount": count,
+                    "cameraID": cam_id,
+                    "event_time": datetime.now().isoformat()
+                }
+                latest_events[cam_id] = evt
+                events_collection.insert_one(evt)
+                print(f"[{cam_id}] [FEED] Pig count changed: {prev}→{count}")
+
+            await asyncio.sleep(5.0)
+        # Loop files again
 
 async def capture_frames():
-    global frame_intervals
+    """
+    Live camera processing for human detection only.
+    """
     while True:
         for cam_id, cap in camera_streams.items():
             ret, frame = cap.read()
-            if ret:
-                frame_intervals[cam_id] += 1
-                # Process frames at specific intervals for performance
-                if frame_intervals[cam_id] % 10 in [5, 15]:
-                    await process_frame(cam_id, frame)
+            if not ret:
+                continue
+
+            frame_intervals[cam_id] += 1
+            if frame_intervals[cam_id] % 10 in (5, 15):
+                await process_frame(cam_id, frame)
         await asyncio.sleep(0.05)
 
-async def process_frame(cam_id, frame):
-    global latest_events, person_counts, recording, video_buffer, last_person_detected_time, recording_buffers
-    global cameraID, BUFFER_TIME, record_start_time  # record_start_time needs to be declared globally
-    
-    person_count = detector.count_people(frame)
-    prev_count = person_counts.get(cam_id, 0)
-    person_counts[cam_id] = person_count
-    person_detected = detector.detect(frame)
+async def track_pig_cross_line():
+    video_path = os.path.join(os.path.dirname(__file__), "pig-cross-line.mp4")
+    cap = cv2.VideoCapture(video_path)
+    cam_id = "PIG_CROSS_LINE_CAM"
 
-    if person_detected:
+    if not cap.isOpened():
+        print("Error: Cannot open pig-cross-line video.")
+        return
+
+    # initialize both trackers
+    pig_detector.prev_out_count[cam_id] = 0
+    pig_counts[cam_id] = 0  # raw-detection buffer
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("Finished processing pig-cross-line video.")
+            break
+
+        # 1) Proper zone-exit detection
+        exits = pig_detector.track_zone_exit(frame, cam_id)
+
+        # 2) Fallback: raw-count drop
+        prev_cnt = pig_counts.get(cam_id, 0)
+        curr_cnt = pig_detector.count(frame)
+        pig_counts[cam_id] = curr_cnt
+        count_drop = max(0, prev_cnt - curr_cnt)
+
+        total_exits = exits + count_drop
+
+        for _ in range(total_exits):
+            # encode this exact frame
+            success, jpeg = cv2.imencode('.jpg', frame)
+            if success:
+                img_bytes = jpeg.tobytes()
+                # store snapshot in GridFS
+                img_id = fs.put(img_bytes,
+                                filename=f"{cam_id}_exit_{int(time.time())}.jpg")
+            else:
+                img_id = None
+
+            event = {
+                "event_type": "Object leaving detected",
+                "cameraID":    cam_id,
+                "event_time":  datetime.now().isoformat(),
+                "snapshot_id": str(img_id)  # reference to the frame in GridFS
+            }
+            latest_events[cam_id] = event
+            events_collection.insert_one(event)
+            print(f"[{cam_id}] Object leaving detected! snapshot_id={img_id}")
+
+        await asyncio.sleep(0.05)
+
+    cap.release()
+    print("Released pig-cross-line capture.")
+
+
+
+async def process_frame(cam_id: str, frame):
+    """
+    Handle human detection on live streams. Pig events are disabled here.
+    """
+    global recording, last_person_detected_time, video_buffer, record_start_time
+
+    # Human detection logic
+    person_count = detector.count_people(frame)
+    prev_p = person_counts.get(cam_id, 0)
+    person_counts[cam_id] = person_count
+    detected = detector.detect(frame)
+
+    if cam_id == "SIM_CAM":
+        return
+
+    if detected:
         last_person_detected_time = time.time()
         if not recording:
             recording = True
             video_buffer = []
-            record_start_time = time.time()  # Start timing recording
+            record_start_time = time.time()
             print("Recording started")
 
     if recording:
         video_buffer.append(frame)
 
-    # If no person detected and the buffer time has expired, stop recording and save
-    if recording and not person_detected:
-        if time.time() - last_person_detected_time > (BUFFER_TIME + 2):
-            recording = False
-            record_end_time = time.time()  # End timing recording
-            video_id = save_video_to_mongodb(video_buffer, record_start_time, record_end_time)
-
-            latest_event = {
-                "event_type": "Human detect",
-                "video_recorded": str(video_id),
-                "event_time": datetime.now().isoformat(),
-                "cameraID": cameraID
-            }
-            latest_events[cameraID] = latest_event
-            events_collection.insert_one(latest_event)
-            print("Recording stopped and event saved to MongoDB")
-
-
-    if person_count > 0:
-        recording_buffers[cam_id].append(frame)
-
-    if person_count != prev_count:
-        event = {
-            "event_type": "Object count changes",
-            "previousCount": prev_count,
-            "currentCount": person_count,
-            "cameraID": cam_id,
-            "event_time": datetime.now().isoformat()
+    # Stop recording when person leaves
+    if recording and not detected and time.time() - last_person_detected_time > (BUFFER_TIME + 2):
+        recording = False
+        video_id = save_video_to_mongodb(video_buffer, record_start_time, time.time())
+        evt = {
+            "event_type": "Human detect",
+            "video_recorded": str(video_id),
+            "event_time": datetime.now().isoformat(),
+            "cameraID": cameraID
         }
-        latest_events[cam_id] = event
-        events_collection.insert_one(event)
+        latest_events[cameraID] = evt
+        events_collection.insert_one(evt)
+        print("Recording stopped and event saved")
 
-    if prev_count > 0 and person_count == 0:
-        event = {
-            "event_type": "Object leaving detected",
-            "cameraID": cam_id,
-            "event_time": datetime.now().isoformat()
-        }
-        latest_events[cam_id] = event
-        events_collection.insert_one(event)
-
+# Endpoints
 @app.get("/latest_event/{cam_id}")
 async def get_latest_event(cam_id: str):
     return latest_events.get(cam_id, {"message": "No detection events recorded yet."})
@@ -218,7 +247,7 @@ async def stream_camera(websocket: WebSocket, cam_id: str):
     except WebSocketDisconnect:
         print(f"Client disconnected from {cam_id}")
 
-# ----------------- Upload Detection Endpoint -------------------
+# Upload detection save function
 
 def save_video_to_mongodb(frames, start_time, end_time):
     if not frames:
@@ -229,34 +258,27 @@ def save_video_to_mongodb(frames, start_time, end_time):
     temp_filename = f"temp_video_{int(time.time())}.mp4"
 
     duration = end_time - start_time
-    effective_fps = len(frames) / duration if duration > 0 else 20.0  
-    speed_multiplier = 1.2  
-    adjusted_fps = effective_fps * speed_multiplier
+    fps = len(frames) / duration if duration > 0 else 20.0
+    adjusted_fps = fps * 1.2
 
     out = cv2.VideoWriter(temp_filename, fourcc, adjusted_fps, (width, height))
     for frame in frames:
         out.write(frame)
     out.release()
 
-    with open(temp_filename, "rb") as video_file:
-        video_id = fs.put(video_file, filename=f"video_{int(time.time())}.mp4")
-
+    with open(temp_filename, "rb") as f:
+        video_id = fs.put(f, filename=os.path.basename(temp_filename))
     os.remove(temp_filename)
     return video_id
 
-
-
 @app.get("/download/{video_id}")
 async def download_video(video_id: str):
-    """Fetch and return a video file from MongoDB GridFS."""
     try:
-        video_file = fs.get(ObjectId(video_id))  # Retrieve file from GridFS
+        video_file = fs.get(ObjectId(video_id))
         return Response(
             content=video_file.read(),
             media_type="video/mp4",
-            headers={
-                "Content-Disposition": f"attachment; filename={video_file.filename}"
-            }
+            headers={"Content-Disposition": f"attachment; filename={video_file.filename}"}
         )
     except gridfs.errors.NoFile:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -267,26 +289,16 @@ async def video_feed(cam_id: str):
         while True:
             ret, frame = camera_streams[cam_id].read()
             if not ret:
-                continue  
-
+                continue
             ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
-                continue  
-
-            # Yield the frame in byte format using the standard multipart boundary format
+                continue
             yield (
                 b'--frame\r\n'
                 b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n'
             )
-            
             time.sleep(0.03)
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
-
-#======TO DO ===================
-#Change dơwnload video to use streaming response select by event_type
-# @app.get("/latest_event/{cam_id}")
-# async def latest_event(cam_id: str):
-#     return {"event": f"Latest event for {cam_id}"}
 
 @app.get("/events")
 async def get_events():
@@ -294,120 +306,3 @@ async def get_events():
     return {"events": events}
 
 
-#==============REQUEST OPENAI===================
-
-def start_scheduler():
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(send_weekly_analysis_request, 'cron', day_of_week='sun', hour=23, minute=59)
-
-
-
-# Hàm tạo prompt và gửi tới ChatGPT
-# def send_weekly_analysis_request():
-#     today = datetime.utcnow()
-#     last_sunday = today - timedelta(days=today.weekday() + 1)
-#     this_sunday = last_sunday + timedelta(days=7)
-
-#     # Lấy các event Count changes trong tuần
-#     events = list(events_collection.find({
-#         "timestamp": {
-#             "$gte": last_sunday,
-#             "$lt": this_sunday
-#         }
-#     }))
-
-#     if not events:
-#         print("No count change events this week.")
-#         return
-
-#     # Tạo prompt gửi cho ChatGPT
-#     prompt = "Dưới đây là danh sách các sự kiện Count changes trong tuần qua. Phân tích và cho biết:\n"\
-#              "- Số liệu thay đổi tăng hay giảm? Đâu là dấu hiệu tốt? Đâu là dấu hiệu bất thường?\n"\
-#              "- Nếu phát huy tốt thì khuyến khích nông trại làm gì để giữ hoặc nâng cao chất lượng?\n"\
-#              "- Nếu bất thường thì nên làm gì để cải thiện trong tuần tới?\n\n"
-
-#     for event in events:
-#         prompt += (
-#             f"📷 Camera: {event['camera_id']}\n"
-#             f"⏱️ Thời gian: {event['timestamp']}\n"
-#             f"🔢 Trước: {event['count_before']}, Sau: {event['count_after']}, Thay đổi: {event['change']}\n"
-#             f"📝 Ghi chú: {event.get('note', 'Không có ghi chú')}\n\n"
-#         )
-
-#     # Gửi tới ChatGPT API
-#     openai.api_key = "key"
-#     response = openai.ChatCompletion.create(
-#         model="gpt-4",
-#         messages=[
-#             {"role": "system", "content": "Bạn là chuyên gia phân tích dữ liệu nông nghiệp."},
-#             {"role": "user", "content": prompt}
-#         ]
-#     )
-
-#     result = response['choices'][0]['message']['content']
-
-#     # Lưu kết quả vào MongoDB (hoặc trả về cho frontend thông qua API)
-#     db["weekly_analysis"].insert_one({
-#         "week_start": last_sunday,
-#         "week_end": this_sunday,
-#         "created_at": datetime.utcnow(),
-#         "analysis": result
-#     })
-
-#     print("✅ Weekly analysis created and stored.")
-def generate_prompt(events: list) -> str:
-    if not events:
-        return "Không có sự kiện Count changes nào để phân tích."
-
-    prompt = "Dưới đây là danh sách các sự kiện Count changes. Hãy phân tích:\n"\
-             "- Số liệu thay đổi tăng hay giảm? Đâu là dấu hiệu tốt? Đâu là dấu hiệu bất thường?\n"\
-             "- Nếu phát huy tốt thì khuyến khích nông trại làm gì để giữ hoặc nâng cao chất lượng?\n"\
-             "- Nếu bất thường thì nên làm gì để cải thiện trong tuần tới?\n\n"
-
-    for event in events:
-        prompt += (
-            f"📷 Camera: {event['camera_id']}\n"
-            f"⏱️ Thời gian: {event['timestamp']}\n"
-            f"🔢 Trước: {event['count_before']}, Sau: {event['count_after']}, Thay đổi: {event['change']}\n"
-            f"📝 Ghi chú: {event.get('note', 'Không có ghi chú')}\n\n"
-        )
-
-    return prompt
-
-
-@app.get("/api/weekly-analysis/latest")
-def get_latest_analysis():
-    latest = db["weekly_analysis"].find_one(sort=[("created_at", -1)])
-    if not latest:
-        return jsonify({"message": "No analysis yet."}), 404
-
-    return jsonify({
-        "week_start": latest["week_start"],
-        "week_end": latest["week_end"],
-        "analysis": latest["analysis"]
-    })
-
-
-
-@app.post("/api/analyze-now")
-def analyze_now_route(request: Request):
-    events = list(events_collection.find({
-        "event_type": "Count changes"
-    }))
-
-    if not events:
-        return jsonify({"message": "Không có sự kiện Count changes nào."}), 404
-
-    openai.api_key = "key"
-    response = openai.completions.create(
-    model="gpt-4o",
-    prompt=generate_prompt(events),
-    max_tokens=100
-    )
-    result = response['choices'][0]['text']
-
-    # result = response['choices'][0]['message']['content']
-
-    return jsonify({
-        "analysis": result
-    })
