@@ -34,6 +34,7 @@ sync_client = pymongo.MongoClient(MONGO_URI)
 db = sync_client["detection"]
 fs = gridfs.GridFS(db)
 events_collection = db["events"]
+humanCount_collection = db["humanCount"]
 PIG_ZONE_POINTS = [(150, 0), (1130, 0), (1130, 720), (150, 720)]
 
 
@@ -46,6 +47,7 @@ camera_sources = {"LAPTOP_CAM": 0}
 camera_streams = {cam: cv2.VideoCapture(src) for cam, src in camera_sources.items()}
 recording_buffers = {}
 latest_events = {}
+latest_humanCount = {}
 BUFFER_TIME = 2
 frame_intervals = {}
 person_counts = {}
@@ -61,7 +63,7 @@ cameraID = "UPLOAD_CAM"
 # Startup: initialize buffers and tasks
 @app.on_event("startup")
 async def initialize_all():
-    global recording_buffers, frame_intervals, person_counts, pig_counts, latest_events
+    global recording_buffers, frame_intervals, person_counts, pig_counts, latest_events,latest_humanCount
 
     # Init live cameras
     for cam in camera_sources:
@@ -73,6 +75,7 @@ async def initialize_all():
 
     # Init upload cam
     latest_events[cameraID] = {}
+    latest_humanCount[cameraID] = {}
 
     # Launch tasks
     asyncio.create_task(capture_frames())
@@ -195,10 +198,10 @@ async def process_frame(cam_id: str, frame):
     global recording, last_person_detected_time, video_buffer, record_start_time
 
     # Human detection logic
-    person_count = detector.count_people(frame)
-    prev_p = person_counts.get(cam_id, 0)
-    person_counts[cam_id] = person_count
     detected = detector.detect(frame)
+    person_count = detector.count_people(frame)
+    prev_count = person_counts.get(cam_id, 0)
+    person_counts[cam_id] = person_count
 
     if cam_id == "SIM_CAM" or cam_id == "PIG_CROSS_LINE_CAM":
         return
@@ -228,6 +231,17 @@ async def process_frame(cam_id: str, frame):
         events_collection.insert_one(evt)
         print("Recording stopped and event saved")
 
+    if person_count != prev_count:
+        event = {
+             "event_type": "Human count changes",
+             "previousCount": prev_count,
+             "currentCount": person_count,
+             "cameraID": cam_id,
+             "event_time": datetime.now().isoformat()
+        }
+        latest_humanCount[cam_id] = event
+        humanCount_collection.insert_one(event)
+
 @app.post("/add_cameras")
 async def add_camera(request: Request):
     camera = await request.json()
@@ -251,6 +265,14 @@ async def get_cameras():
 @app.get("/latest_event/{cam_id}")
 async def get_latest_event(cam_id: str):
     return latest_events.get(cam_id, {"message": "No detection events recorded yet."})
+
+# Endpoints
+@app.get("/latest_human_count/{cam_id}")
+async def get_latest_human_count(cam_id: str):
+    if cam_id not in latest_humanCount:
+        return {"message": "No detection events recorded yet."}
+    return latest_humanCount.get(cam_id)
+
 
 @app.websocket("/stream/{cam_id}")
 async def stream_camera(websocket: WebSocket, cam_id: str):
